@@ -55,8 +55,9 @@ cd ~/projects/project-a && claude
 cd ~/projects/project-b && codex
 ```
 
-Claude Code registers on session start. Codex registers through App Server when
-its TUI thread opens, before the first prompt. Confirm both peers with
+Claude Code registers on session start. Codex registers on session start too:
+through the App Server when started with `--remote unix://`, else through its
+SessionStart hook. Confirm both peers with
 `repowire peer list`, then in `project-a`:
 
 > Ask project-b what API endpoints they expose.

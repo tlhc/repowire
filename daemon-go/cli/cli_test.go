@@ -844,7 +844,7 @@ func TestExplicitCodexBridgeRestartPreservesAppServer(t *testing.T) {
 	}
 }
 
-func TestInstallCodexUsesNativeThreadsWhenAppServerIsAvailable(t *testing.T) {
+func TestInstallCodexKeepsSessionHooksWhenAppServerIsAvailable(t *testing.T) {
 	homeDir := t.TempDir()
 	binDir := filepath.Join(homeDir, "bin")
 	if err := os.MkdirAll(binDir, 0o700); err != nil {
@@ -873,12 +873,15 @@ func TestInstallCodexUsesNativeThreadsWhenAppServerIsAvailable(t *testing.T) {
 	}
 	hooks, _ := data["hooks"].(map[string]any)
 	entries, _ := hooks["SessionStart"].([]any)
-	if len(entries) != 1 || fmt.Sprint(entries[0]) == "" || !strings.Contains(fmt.Sprint(entries[0]), "keep-me") {
+	if len(entries) != 2 || !strings.Contains(fmt.Sprint(entries), "keep-me") || !strings.Contains(fmt.Sprint(entries), "hook session --backend=codex") {
 		t.Fatalf("SessionStart hooks = %#v", entries)
 	}
 	stopEntries, _ := hooks["Stop"].([]any)
-	if len(stopEntries) != 2 || !strings.Contains(fmt.Sprint(stopEntries), "keep-stop") || !strings.Contains(fmt.Sprint(stopEntries), "--reminders-only") {
+	if len(stopEntries) != 2 || !strings.Contains(fmt.Sprint(stopEntries), "keep-stop") || strings.Contains(fmt.Sprint(stopEntries), "--reminders-only") {
 		t.Fatalf("Stop hooks = %#v", stopEntries)
+	}
+	if prompt, _ := hooks["UserPromptSubmit"].([]any); len(prompt) != 1 || !strings.Contains(fmt.Sprint(prompt), "hook prompt --backend=codex") {
+		t.Fatalf("UserPromptSubmit hooks = %#v", prompt)
 	}
 	configRaw, err := os.ReadFile(filepath.Join(homeDir, ".codex", "config.toml"))
 	if err != nil || !strings.Contains(string(configRaw), "[mcp_servers.repowire]") || !strings.Contains(string(configRaw), "hooks.state.") {

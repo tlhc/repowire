@@ -29,7 +29,9 @@ func Run(args []string) int {
 	name := args[0]
 	flags := flag.NewFlagSet("hook "+name, flag.ContinueOnError)
 	backend := flags.String("backend", "claude-code", "agent backend")
-	remindersOnly := flags.Bool("reminders-only", false, "only block on unacked asks")
+	// Still accepted for hooks.json entries written by older setups; App Server
+	// threads are now recognized per invocation instead.
+	_ = flags.Bool("reminders-only", false, "deprecated, ignored")
 	if flags.Parse(args[1:]) != nil {
 		return 2
 	}
@@ -37,7 +39,7 @@ func Run(args []string) int {
 	case "session":
 		return runSession(*backend)
 	case "stop":
-		return runStop(*backend, *remindersOnly)
+		return runStop(*backend)
 	case "prompt":
 		return runPrompt(*backend)
 	case "notification":
@@ -63,6 +65,11 @@ func handleSession(raw map[string]any, backend string, emitContext bool) int {
 	payload := Normalize(raw, backend)
 	cwd := firstNonempty(payload.CWD, mustGetwd())
 	info := getTmuxInfo()
+	bindRuntimeKey(info.PaneID, payload.SessionID)
+	agentPID := resolveAgentPID(info.PaneID)
+	if backend == "codex" && hostedByAppServer(agentPID) {
+		return 0
+	}
 	if payload.Event == "SessionEnd" || stringValue(raw, "hook_event_name") == "SessionEnd" {
 		writeHandoff(cwd, backend, payload.SessionID, payload.TranscriptPath, "", "")
 		if stringValue(raw, "reason") != "clear" {
@@ -86,7 +93,7 @@ func handleSession(raw map[string]any, backend string, emitContext bool) int {
 	needsTakeover := !locked
 	livePeerID := ""
 	if needsTakeover {
-		livePeerID = peerForPane(info.PaneID)
+		livePeerID = confirmedLivePeer(info.PaneID, prior)
 	}
 	priorPeerID := firstNonempty(stringValue(prior, "peer_id"), livePeerID)
 	if needsTakeover && reusablePaneRegistration(prior, payload.SessionID, cwd, backend, priorPeerID, livePeerID) {
@@ -101,19 +108,11 @@ func handleSession(raw map[string]any, backend string, emitContext bool) int {
 		lock.Close()
 		return 0
 	}
-	if circle == "" && info.PaneID != "" && hint != nil {
+	if circle == "" && hint != nil {
 		circle, circleSource = stringValue(hint, "circle"), "spawn_hint"
 	}
 	if circle == "" {
-		errf("session: no circle for %s; start in tmux or spawn with --circle", backend)
-		lock.Close()
-		return 0
-	}
-	agentPID := os.Getppid()
-	if isShell, known := commandIsShell(agentPID); known && isShell {
-		if pid := findAgentPID(info.PaneID); pid > 0 {
-			agentPID = pid
-		}
+		circle, circleSource = fallbackCircle(cwd), "fallback"
 	}
 	if certified := validateCertificateIdentity(backend, cwd, info.PaneID, agentPID); certified != nil {
 		hint = map[string]any{
@@ -159,10 +158,8 @@ func handleSession(raw map[string]any, backend string, emitContext bool) int {
 		request["pane_id"] = info.PaneID
 	}
 	if hint != nil {
-		if info.PaneID != "" {
-			if value := stringValue(hint, "peer_id"); value != "" {
-				request["peer_id"] = value
-			}
+		if value := stringValue(hint, "peer_id"); value != "" {
+			request["peer_id"] = value
 		}
 		if boolValue(hint, "pending_first_turn") {
 			request["turn_state"] = "pending_first_turn"
@@ -212,6 +209,7 @@ func handleSession(raw map[string]any, backend string, emitContext bool) int {
 		"backend": backend, "cwd": cwd, "display_name": displayName,
 		"hook_session_id": payload.SessionID, "peer_id": peerID,
 		"agent_pid": agentPID, "parent_pid": parentPID(agentPID),
+		"circle": circle,
 	}
 	if socket := os.Getenv(claudeMessagingSocketEnv); backend == "claude-code" && socket != "" {
 		meta["claude_messaging_socket"] = socket
@@ -221,9 +219,14 @@ func handleSession(raw map[string]any, backend string, emitContext bool) int {
 	}
 	if cert, ok := registered["birth_certificate"].(map[string]any); ok {
 		meta["birth_certificate"] = cert
+		if backend == "codex" && payload.SessionID != "" {
+			// Codex's hook session id is its thread id, which is how the MCP
+			// shim looks this certificate up.
+			_ = WriteRuntimeIdentity(backend, payload.SessionID, map[string]any{"birth_certificate": cert})
+		}
 	}
 	_ = writeMetadata(info.PaneID, meta)
-	if err := startSessionWSHook(info.PaneID, peerID, displayName, backend, cwd, agentPID, lock); err != nil {
+	if err := startSessionWSHook(info.PaneID, peerID, displayName, backend, cwd, circle, agentPID, lock); err != nil {
 		errf("failed to start WebSocket hook: %v", err)
 	}
 	lock.Close()
@@ -264,7 +267,29 @@ func claudeInboxMetadataStale(meta map[string]any, backend string) bool {
 	return registered != current
 }
 
-func runStop(backend string, remindersOnly bool) int {
+// hookAddress resolves how this invocation names its peer to the daemon: by
+// pane when tmux supplies one, else by the peer id SessionStart recorded. An
+// empty identifier means the runtime has not registered yet.
+func hookAddress(paneID string) (string, bool) {
+	if paneID != "" {
+		return paneID, true
+	}
+	return stringValue(ReadPaneRuntimeMetadata(paneID), "peer_id"), false
+}
+
+// ensureRegistered re-runs SessionStart for a session whose hook state is
+// missing or stale, so a later hook can still address its peer. This is how a
+// session that started before its SessionStart hook existed comes online.
+func ensureRegistered(raw map[string]any, backend string) {
+	repair := make(map[string]any, len(raw)+1)
+	for key, value := range raw {
+		repair[key] = value
+	}
+	repair["hook_event_name"] = "SessionStart"
+	repairPromptSession(repair, backend, false)
+}
+
+func runStop(backend string) int {
 	raw, err := readInput()
 	if err != nil {
 		errf("stop: invalid JSON input: %v", err)
@@ -274,15 +299,21 @@ func runStop(backend string, remindersOnly bool) int {
 		return 0
 	}
 	payload := Normalize(raw, backend)
-	if remindersOnly {
+	paneID := getPaneID()
+	bindRuntimeKey(paneID, payload.SessionID)
+	if backend == "codex" && hostedByAppServer(resolveAgentPID(paneID)) {
+		// The bridge owns lifecycle and chat for an App Server thread; the hook
+		// only resurfaces an ask that is still open after the turn.
 		if block := reminderBlockForRuntimeSession(payload.SessionID); block != "" {
 			printJSON(map[string]string{"decision": "block", "reason": block})
 		}
 		return 0
 	}
-	paneID := getPaneID()
-	if paneID != "" {
+	if hasRuntimeState(paneID) {
 		_ = os.Remove(streamerPIDPath(paneID))
+		if identifier, _ := hookAddress(paneID); identifier == "" {
+			ensureRegistered(raw, backend)
+		}
 	}
 	maybeRespawn(paneID, backend, firstNonempty(payload.CWD, mustGetwd()))
 	user, assistant, turnID, calls := stopTurn(payload.TranscriptPath, payload.ResponseText)
@@ -295,18 +326,22 @@ func runStop(backend string, remindersOnly bool) int {
 	if assistant != "" {
 		postChatTurn(peer, "assistant", assistant, calls, paneID, payload.SessionID, turnID)
 	}
+	identifier, byPane := hookAddress(paneID)
 	var blocks []string
-	if paneID != "" {
-		if block := queuedDeliveryBlock(paneID); block != "" {
+	if identifier != "" {
+		key := "peer_id"
+		if byPane {
+			key = "pane_id"
+		}
+		if block := queuedDeliveryBlock(key, identifier); block != "" {
 			blocks = append(blocks, block)
 		}
-		if block := reminderBlock(paneID, handledCIDs(calls)); block != "" {
+		if block := reminderBlockFrom(key, identifier, handledCIDs(calls)); block != "" {
 			blocks = append(blocks, block)
 		}
 	}
-	identifier, byPane := peer, false
-	if paneID != "" {
-		identifier, byPane = paneID, true
+	if identifier == "" {
+		identifier, byPane = peer, false
 	}
 	if !updateStatus(identifier, "online", "idle", payload.Model, byPane) {
 		errf("stop: failed to update status for %s", identifier)
@@ -348,19 +383,20 @@ func handlePrompt(raw map[string]any, backend string) int {
 		return 0
 	}
 	pane := getPaneID()
-	updated := pane != "" && updateStatus(pane, "busy", "working", payload.Model, true)
-	staleInbox := backend == "claude-code" && pane != "" && claudeInboxMetadataStale(ReadPaneRuntimeMetadata(pane), backend)
-	if backend == "claude-code" && pane != "" && (!updated || staleInbox) {
-		repair := make(map[string]any, len(raw))
-		for key, value := range raw {
-			repair[key] = value
-		}
-		repair["hook_event_name"] = "SessionStart"
-		repairPromptSession(repair, backend, false)
-		updated = updateStatus(pane, "busy", "working", payload.Model, true)
+	bindRuntimeKey(pane, payload.SessionID)
+	if backend == "codex" && hostedByAppServer(resolveAgentPID(pane)) {
+		return 0
 	}
-	if pane != "" && !updated {
-		errf("prompt: failed to update status for pane %s", pane)
+	identifier, byPane := hookAddress(pane)
+	updated := identifier != "" && updateStatus(identifier, "busy", "working", payload.Model, byPane)
+	staleInbox := backend == "claude-code" && hasRuntimeState(pane) && claudeInboxMetadataStale(ReadPaneRuntimeMetadata(pane), backend)
+	if hasRuntimeState(pane) && (!updated || staleInbox) {
+		ensureRegistered(raw, backend)
+		identifier, byPane = hookAddress(pane)
+		updated = identifier != "" && updateStatus(identifier, "busy", "working", payload.Model, byPane)
+	}
+	if hasRuntimeState(pane) && !updated {
+		errf("prompt: failed to update status for %s", firstNonempty(identifier, "unregistered runtime"))
 	}
 	if backend == "claude-code" && pane != "" && payload.TranscriptPath != "" {
 		if cfg, err := config.Load(); err == nil && cfg.Experiments.ChatTurnStreaming {
@@ -377,8 +413,11 @@ func runNotification() int {
 		return 0
 	}
 	if stringValue(raw, "hook_event_name") == "Notification" && stringValue(raw, "notification_type") == "idle_prompt" {
-		if pane := getPaneID(); pane != "" && !updateStatus(pane, "online", "awaiting_input", "", true) {
-			errf("notification: failed to update status for pane %s", pane)
+		pane := getPaneID()
+		bindRuntimeKey(pane, stringValue(raw, "session_id"))
+		if identifier, byPane := hookAddress(pane); identifier != "" &&
+			!updateStatus(identifier, "online", "awaiting_input", "", byPane) {
+			errf("notification: failed to update status for %s", identifier)
 		}
 	}
 	return 0
@@ -449,7 +488,12 @@ func denyDecision(reason string) map[string]any {
 }
 
 func postChatTurn(peer, role, text string, calls []toolCall, paneID, sessionID, turnID string) {
-	payload := map[string]any{"peer": peer, "role": role, "text": text}
+	meta := ReadPaneRuntimeMetadata(paneID)
+	display := firstNonempty(stringValue(meta, "display_name"), peer)
+	payload := map[string]any{"peer": display, "role": role, "text": text}
+	if id := stringValue(meta, "peer_id"); id != "" {
+		payload["peer_id"] = id
+	}
 	if paneID != "" {
 		payload["pane_id"] = paneID
 	}
@@ -485,10 +529,6 @@ func summarizeToolInput(input map[string]any) string {
 		}
 	}
 	return ""
-}
-
-func reminderBlock(paneID string, handled map[string]bool) string {
-	return reminderBlockFrom("pane_id", paneID, handled)
 }
 
 func reminderBlockForRuntimeSession(sessionID string) string {
@@ -539,8 +579,8 @@ func reminderBlockFrom(key, value string, handled map[string]bool) string {
 	return strings.Join(lines, "\n")
 }
 
-func queuedDeliveryBlock(paneID string) string {
-	result := daemonGet("/deliveries/pending?pane_id=" + url.QueryEscape(paneID))
+func queuedDeliveryBlock(key, value string) string {
+	result := daemonGet("/deliveries/pending?" + key + "=" + url.QueryEscape(value))
 	items, _ := result["deliveries"].([]any)
 	if len(items) == 0 {
 		return ""
@@ -564,6 +604,21 @@ func peerForPane(paneID string) string {
 		return ""
 	}
 	return stringValue(daemonGet("/peers/by-pane/"+url.PathEscape(paneID)), "peer_id")
+}
+
+func confirmedLivePeer(paneID string, prior map[string]any) string {
+	if paneID != "" {
+		return peerForPane(paneID)
+	}
+	peerID := stringValue(prior, "peer_id")
+	if peerID == "" {
+		return ""
+	}
+	status := stringValue(findPeer(peerList(), peerID, ""), "status")
+	if status == "online" || status == "busy" {
+		return peerID
+	}
+	return ""
 }
 
 func peerList() []map[string]any {

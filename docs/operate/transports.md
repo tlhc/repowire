@@ -38,10 +38,13 @@ tool-call summaries, and handoff state. On the idle transition it reads the
 completed turn once, since App Server item events are client-scoped; no polling
 is involved.
 The ordinary Codex TUI remains visible. Tmux is optional placement/lifecycle
-evidence and is not the delivery channel. A reminder-only Stop hook resurfaces
-asks that remain open after a turn; it does not duplicate App Server lifecycle
-or chat handling. Codex releases without a Unix App Server listener are not a
-supported inbound-delivery path.
+evidence and is not the delivery channel. For App Server threads the hooks only
+resurface asks that remain open after a turn; they do not duplicate App Server
+lifecycle or chat handling. A standalone `codex` TUI (no `--remote`) uses the
+hooks transport instead: SessionStart registers it and starts the ws-hook
+sidecar, so it stays online, and inbound messages are queued and surfaced as
+the Stop hook's block reason after its next turn. Push delivery to a standalone
+TUI is not available.
 
 ## Plugin and extension transports
 

@@ -21,27 +21,29 @@ func resolveMCPIdentity(codexThreadID string) (string, string) {
 	claimedPeerID := os.Getenv("REPOWIRE_PEER_ID")
 	backend := firstNonempty(os.Getenv("REPOWIRE_BACKEND"), "claude-code")
 	cwd := mustGetwd()
-	paneID := getPaneID()
 	agentPID := os.Getppid()
-	paneMeta := ReadPaneRuntimeMetadata(paneID)
+	threadID := ""
 	if backend == "codex" {
-		threadID := firstNonempty(codexThreadID, os.Getenv("CODEX_THREAD_ID"))
+		threadID = firstNonempty(codexThreadID, os.Getenv("CODEX_THREAD_ID"))
+		// The thread certificate carries its own pane evidence, so no pane
+		// probe is needed on this path.
 		if cert, ok := ReadRuntimeIdentity(backend, threadID)["birth_certificate"].(map[string]any); ok {
-			if peer, _ := validateCertificates(backend, cwd, paneID, agentPID, []map[string]any{cert}); peer != nil {
-				return firstNonempty(stringValue(peer, "peer_id"), stringValue(peer, "display_name")), stringValue(cert, "nonce")
+			if peer, _ := validateCertificates(backend, cwd, "", agentPID, []map[string]any{cert}); peer != nil {
+				return peerIdentity(peer), stringValue(cert, "nonce")
 			}
 		}
 		// Codex App Server shares one process and MCP subprocess across many
-		// threads. A pane/PID certificate belongs to some other thread and must
-		// never be used as fallback identity for this thread.
-		if threadID == "" {
-			if peer, cert := validateCertificateIdentityWithCert(backend, cwd, paneID, agentPID); peer != nil {
-				return firstNonempty(stringValue(peer, "peer_id"), stringValue(peer, "display_name")), stringValue(cert, "nonce")
-			}
+		// threads. The bridge registers those threads; a pane/PID certificate
+		// or a fresh registration here would name some other thread.
+		if hostedByAppServer(agentPID) {
+			return filepath.Base(cwd), ""
 		}
-	} else {
+	}
+	paneID := getPaneID()
+	paneMeta := ReadPaneRuntimeMetadata(paneID)
+	if threadID == "" {
 		if peer, cert := validateCertificateIdentityWithCert(backend, cwd, paneID, agentPID); peer != nil {
-			return firstNonempty(stringValue(peer, "peer_id"), stringValue(peer, "display_name")), stringValue(cert, "nonce")
+			return peerIdentity(peer), stringValue(cert, "nonce")
 		}
 	}
 	// An expired certificate renews the pane's existing runtime identity. PID,
@@ -51,16 +53,16 @@ func resolveMCPIdentity(codexThreadID string) (string, string) {
 		panePeerID = stringValue(paneMeta, "peer_id")
 	}
 	hint := consumeSpawnHint(cwd, backend)
-	info := getTmuxInfo()
+	info := tmuxInfoFor(paneID)
 	_, circle, source, err := tmuxPlacement(info)
 	if err != nil {
 		return filepath.Base(cwd), ""
 	}
-	if circle == "" && paneID != "" && hint != nil {
+	if circle == "" && hint != nil {
 		circle, source = stringValue(hint, "circle"), "spawn_hint"
 	}
 	if circle == "" {
-		return filepath.Base(cwd), ""
+		circle, source = fallbackCircle(cwd), "fallback"
 	}
 	body := map[string]any{
 		"name": filepath.Base(cwd), "path": cwd, "circle": circle,
@@ -77,11 +79,9 @@ func resolveMCPIdentity(codexThreadID string) (string, string) {
 	} else if claimedPeerID != "" {
 		body["peer_id"] = claimedPeerID
 	}
-	if hint != nil {
-		if paneID != "" && panePeerID == "" {
-			if value := stringValue(hint, "peer_id"); value != "" {
-				body["peer_id"] = value
-			}
+	if hint != nil && panePeerID == "" {
+		if value := stringValue(hint, "peer_id"); value != "" {
+			body["peer_id"] = value
 		}
 	}
 	status, result := daemonRequest(http.MethodPost, "/peers", body, 2*time.Second)
@@ -98,9 +98,17 @@ func resolveMCPIdentity(codexThreadID string) (string, string) {
 		} else {
 			writeBirthCertificate(backend, agentPID, paneID, cert)
 		}
+		if threadID != "" {
+			// Bind the thread so later calls resolve without re-registering.
+			_ = WriteRuntimeIdentity(backend, threadID, map[string]any{"birth_certificate": cert})
+		}
 		proof = stringValue(cert, "nonce")
 	}
 	return firstNonempty(stringValue(result, "peer_id"), stringValue(result, "display_name"), filepath.Base(cwd)), proof
+}
+
+func peerIdentity(peer map[string]any) string {
+	return firstNonempty(stringValue(peer, "peer_id"), stringValue(peer, "display_name"))
 }
 
 // MCPIdentityProof returns the resolved peer identity plus the nonce of a

@@ -12,8 +12,9 @@ For every agent runtime it finds, the Go CLI wires the appropriate Repowire
 transport. Auto-detection covers Claude Code, Codex,
 OpenCode, and Pi. Then it installs the Go daemon as a user service (launchd on
 macOS, systemd on Linux). When Codex exposes an App Server Unix listener, setup
-also installs its independent thread bridge and keeps only Codex's
-pending-ask reminder Stop hook.
+also installs its independent thread bridge. Codex's SessionStart,
+UserPromptSubmit, and Stop hooks are installed either way; they defer to the
+bridge for App Server threads.
 
 Setup also removes Repowire-owned legacy Gemini CLI and Antigravity entries.
 It preserves unrelated settings and leaves custom retired-backend spawn keys

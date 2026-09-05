@@ -32,12 +32,15 @@ because those records may authorize destructive pane operations.
 
 ### Codex
 
-Current Codex releases use App Server for registration, lifecycle, chat, and
-delivery. They retain only a reminder-only Stop hook so unacknowledged asks
-resurface after a turn. Check `repowire service status`,
-`~/.repowire/codex-bridge.log`, and the `Stop` entry in
-`~/.codex/hooks.json`. Older Codex releases without `app-server --listen` retain
-the full hooks transport.
+A Codex thread hosted by the App Server (`codex --remote unix://`) is
+registered, steered, and reported by the bridge; the hooks step aside for it
+except for the Stop reminder. Check `repowire service status` and
+`~/.repowire/codex-bridge.log`. A standalone `codex` TUI registers through its
+SessionStart hook and stays online through the ws-hook sidecar. Check the
+`SessionStart`, `UserPromptSubmit`, and `Stop` entries in `~/.codex/hooks.json`,
+that Codex trusts them (`/hooks`), and `~/.cache/repowire/logs/ws-hook-*.log`.
+Inbound messages to a standalone TUI are queued and surface after its next
+turn; push delivery needs the App Server.
 
 ### OpenCode
 

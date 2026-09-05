@@ -24,12 +24,12 @@ const (
 	claudeMessagingTokenEnv  = "CLAUDE_CODE_MESSAGING_TOKEN"
 )
 
-func startWSHook(paneID, peerID, displayName, backend, cwd string, agentPID int, lock *os.File) error {
+func startWSHook(paneID, peerID, displayName, backend, cwd, circle string, agentPID int, lock *os.File) error {
 	executable, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(wsHookPath(paneID, ".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logFile, err := os.OpenFile(wsHookPath(paneID, ".log"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -40,8 +40,12 @@ func startWSHook(paneID, peerID, displayName, backend, cwd string, agentPID int,
 		"REPOWIRE_AGENT_PID="+strconv.Itoa(agentPID),
 		"REPOWIRE_BACKEND="+backend,
 		"REPOWIRE_HOOK_LOCK_FD=3",
-		"TMUX_PANE="+paneID,
 	)
+	if paneID != "" {
+		env = append(env, "TMUX_PANE="+paneID)
+	} else {
+		env = append(env, runtimeKeyEnv+"="+os.Getenv(runtimeKeyEnv), circleEnv+"="+circle)
+	}
 	meta := ReadPaneRuntimeMetadata(paneID)
 	if socket := stringValue(meta, "claude_messaging_socket"); socket != "" {
 		env = append(env, claudeMessagingSocketEnv+"="+socket)
@@ -91,7 +95,7 @@ func errorsIsPermission(err error) bool {
 }
 
 func maybeRespawn(paneID, backend, cwd string) bool {
-	if paneID == "" {
+	if !hasRuntimeState(paneID) {
 		return false
 	}
 	raw, err := os.ReadFile(wsHookPath(paneID, ".pid"))
@@ -118,7 +122,7 @@ func maybeRespawn(paneID, backend, cwd string) bool {
 		return false
 	}
 	agentPID := intFromAny(meta["agent_pid"])
-	return startWSHook(paneID, stringValue(meta, "peer_id"), displayName, metaBackend, metaCWD, agentPID, lock) == nil
+	return startWSHook(paneID, stringValue(meta, "peer_id"), displayName, metaBackend, metaCWD, stringValue(meta, "circle"), agentPID, lock) == nil
 }
 
 // ReconcileWSHook replaces a disconnected pane hook after the daemon has
@@ -152,7 +156,7 @@ func ReconcileWSHook(paneID, peerID, displayName, backend, cwd string, agentPID 
 	if err := writeMetadata(paneID, meta); err != nil {
 		return false, err
 	}
-	if err := startWSHook(paneID, peerID, displayName, backend, cwd, agentPID, lock); err != nil {
+	if err := startWSHook(paneID, peerID, displayName, backend, cwd, stringValue(meta, "circle"), agentPID, lock); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -177,8 +181,8 @@ func RunWS() int {
 		syscall.CloseOnExec(fd)
 	}
 	paneID := os.Getenv("TMUX_PANE")
-	if paneID == "" {
-		errf("ws-hook: TMUX_PANE not set")
+	if paneID == "" && os.Getenv(runtimeKeyEnv) == "" {
+		errf("ws-hook: neither TMUX_PANE nor %s set", runtimeKeyEnv)
 		return 1
 	}
 	info := getTmuxInfo()
@@ -187,14 +191,17 @@ func RunWS() int {
 		errf("ws-hook: load circle boundary: %v", err)
 		return 1
 	}
+	cwd, _ := os.Getwd()
+	if circle == "" && paneID == "" {
+		circle, source = fallbackCircle(cwd), "fallback"
+	}
 	if circle == "" {
-		errf("ws-hook: no tmux circle; spawn the peer with --circle")
+		errf("ws-hook: no circle; start in tmux or set %s", circleEnv)
 		return 1
 	}
 	displayName := getDisplayName()
 	backend := firstNonempty(os.Getenv("REPOWIRE_BACKEND"), "claude-code")
 	agentPID, _ := strconv.Atoi(os.Getenv("REPOWIRE_AGENT_PID"))
-	cwd, _ := os.Getwd()
 	peerID := os.Getenv("REPOWIRE_PEER_ID")
 	lastPeerID := peerID
 	expectedCommand, replacementPID := capturePaneBaseline(paneID)
@@ -214,10 +221,9 @@ func RunWS() int {
 		if agentPID > 0 && !pidAlive(agentPID) {
 			if replacement := findExpectedAgentPID(paneID, expectedCommand); replacement > 0 && replacement != agentPID {
 				agentPID = replacement
-			} else if safe := paneSafe(paneID, expectedCommand); safe != nil && !*safe {
+			} else if agentGone(paneID, expectedCommand) {
 				markOffline(lastPeerID, "agent_exited", "ws_hook", fmt.Sprintf("agent pid %d for pane %s exited", agentPID, paneID))
-				ClearPaneRuntimeState(paneID)
-				return 0
+				return retire(paneID)
 			}
 		}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -268,8 +274,7 @@ func RunWS() int {
 		if stringValue(response, "type") == "error" && stringValue(response, "code") == "peer_retired" {
 			_ = conn.Close(websocket.StatusNormalClosure, "retired")
 			cancel()
-			ClearPaneRuntimeState(paneID)
-			return 0
+			return retire(paneID)
 		}
 		if stringValue(response, "type") != "connected" {
 			_ = conn.CloseNow()
@@ -299,10 +304,9 @@ func RunWS() int {
 				case gone := <-exited:
 					if gone {
 						markOffline(lastPeerID, "agent_exited", "ws_hook", fmt.Sprintf("agent pid %d for pane %s exited", agentPID, paneID))
-						ClearPaneRuntimeState(paneID)
 						_ = conn.CloseNow()
 						cancel()
-						return 0
+						return retire(paneID)
 					}
 				default:
 				}
@@ -313,8 +317,7 @@ func RunWS() int {
 		_ = conn.CloseNow()
 		cancel()
 		if stop {
-			ClearPaneRuntimeState(paneID)
-			return 0
+			return retire(paneID)
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -336,7 +339,7 @@ func watchAgent(ctx context.Context, conn *websocket.Conn, paneID string, agentP
 				watched = replacement
 				continue
 			}
-			if safe := paneSafe(paneID, expectedCommand); safe != nil && !*safe {
+			if agentGone(paneID, expectedCommand) {
 				select {
 				case exited <- true:
 				default:
@@ -393,6 +396,24 @@ func handleMessage(ctx context.Context, conn *websocket.Conn, data map[string]an
 		sendFrameError(ctx, conn, stringValue(data, "correlation_id"), detail)
 	}
 	return false, unsafeStrikes
+}
+
+// retire drops the state this finished hook owns. The lock file stays so a
+// resume cannot open a new inode and take a second exclusive lock.
+func retire(paneID string) int {
+	ClearPaneRuntimeState(paneID)
+	return 0
+}
+
+// agentGone decides whether a dead agent pid is terminal. A pane-backed peer
+// defers to live pane evidence; a pane-less peer has no such evidence, so the
+// pid is the whole signal.
+func agentGone(paneID, expectedCommand string) bool {
+	if paneID == "" {
+		return true
+	}
+	safe := paneSafe(paneID, expectedCommand)
+	return safe != nil && !*safe
 }
 
 func claudeMessagingSocket() string {

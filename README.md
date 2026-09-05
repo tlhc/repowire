@@ -29,9 +29,9 @@ Repowire runs locally by default through a daemon on your machine. The hosted re
 
 ## Quickstart
 
-**Requirements:** macOS or Linux. Tmux is required for the default Claude Code
-workflow and Repowire-managed spawning/lifecycle, but not for pane-less Codex,
-OpenCode, or Pi connections. Python is not required.
+**Requirements:** macOS or Linux. Tmux is required for Repowire-managed spawning
+and lifecycle. Claude Code, Codex, OpenCode, and Pi can register without a pane.
+Python is not required.
 
 **1. Install Repowire and wire your agents.**
 
@@ -63,7 +63,7 @@ cd ~/projects/project-b && codex
 **3. Check that both peers appeared.**
 
 Claude Code registers on session start. Codex registers through App Server when
-its TUI thread opens, before the first prompt. Run:
+started with `--remote unix://`, else through its SessionStart hook. Run:
 
 ```bash
 repowire peer list

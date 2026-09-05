@@ -15,6 +15,7 @@ import (
 )
 
 func TestReusablePaneRegistrationRequiresConfirmedLivePeer(t *testing.T) {
+	t.Setenv(claudeMessagingSocketEnv, "")
 	prior := map[string]any{
 		"hook_session_id": "session-1", "cwd": "/project", "backend": "claude-code", "peer_id": "repow-1",
 	}
@@ -93,7 +94,7 @@ func TestPromptRepairsMissingClaudePaneRegistration(t *testing.T) {
 	t.Setenv(claudeMessagingTokenEnv, "current-token")
 	startedPeer := ""
 	previous := startSessionWSHook
-	startSessionWSHook = func(_ string, peerID, _, _, _ string, _ int, _ *os.File) error {
+	startSessionWSHook = func(_ string, peerID, _, _, _, _ string, _ int, _ *os.File) error {
 		startedPeer = peerID
 		return nil
 	}

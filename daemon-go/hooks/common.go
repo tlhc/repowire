@@ -26,6 +26,13 @@ const (
 	hookVersion           = 1
 	paneUnsafeStrikeLimit = 3
 	hintTTL               = 5 * time.Minute
+
+	// runtimeKeyEnv scopes hook-owned state files when the agent runs outside
+	// tmux. Without it every pane-less session shares the "unknown" pane token
+	// and therefore one lock, pid file, and metadata file.
+	runtimeKeyEnv = "REPOWIRE_RUNTIME_KEY"
+	// circleEnv supplies the circle when no tmux boundary can provide one.
+	circleEnv = "REPOWIRE_CIRCLE"
 )
 
 var shellCommands = map[string]bool{
@@ -146,11 +153,40 @@ func WriteRuntimeIdentity(backend, sessionID string, update map[string]any) erro
 }
 
 func paneToken(paneID string) string {
-	value := strings.NewReplacer("%", "", "/", "", "\\", "").Replace(paneID)
-	if value == "" {
-		return "unknown"
+	if paneID != "" {
+		return fileToken(paneID)
 	}
-	return value
+	if key := os.Getenv(runtimeKeyEnv); key != "" {
+		return fileToken(key)
+	}
+	return "unknown"
+}
+
+// fileToken makes an identifier safe for a file name. An identifier with no
+// safe characters left falls back to a digest rather than the shared "unknown"
+// token, so two sessions never collide on one state file.
+func fileToken(id string) string {
+	if value := strings.NewReplacer("%", "", "/", "", "\\", "", ".", "", " ", "").Replace(id); value != "" {
+		return value
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:8])
+}
+
+// bindRuntimeKey scopes this process's hook state files. A tmux pane already
+// scopes them; outside tmux the runtime session id takes that role, and it is
+// exported so the ws-hook child resolves the same paths.
+func bindRuntimeKey(paneID, sessionID string) {
+	if paneID != "" || sessionID == "" || os.Getenv(runtimeKeyEnv) != "" {
+		return
+	}
+	_ = os.Setenv(runtimeKeyEnv, sessionID)
+}
+
+// hasRuntimeState reports whether hook-owned state files are addressable. The
+// pane id is one way to address them; an exported runtime key is the other.
+func hasRuntimeState(paneID string) bool {
+	return paneID != "" || os.Getenv(runtimeKeyEnv) != ""
 }
 
 func paneLogsDir() string {
@@ -168,7 +204,7 @@ func WSHookMetaPath(paneID string) string { return wsHookPath(paneID, ".meta.jso
 // ReadPaneRuntimeMetadata reads hook-owned pane metadata, falling back to the
 // legacy cwd file when an older hook has not written metadata yet.
 func ReadPaneRuntimeMetadata(paneID string) map[string]any {
-	if paneID == "" {
+	if !hasRuntimeState(paneID) {
 		return map[string]any{}
 	}
 	var out map[string]any
@@ -187,7 +223,7 @@ func ReadPaneRuntimeMetadata(paneID string) map[string]any {
 }
 
 func writeMetadata(paneID string, data map[string]any) error {
-	if paneID == "" {
+	if !hasRuntimeState(paneID) {
 		return nil
 	}
 	raw, err := json.Marshal(data)
@@ -213,21 +249,43 @@ func writeMetadata(paneID string, data map[string]any) error {
 	return nil
 }
 
+func birthCertificatePath(backend string, agentPID int, paneID string) string {
+	safeBackend := strings.NewReplacer("/", "-", "\\", "-").Replace(backend)
+	return filepath.Join(paneLogsDir(), fmt.Sprintf("birth-%s-%d-%s.json", safeBackend, agentPID, paneToken(paneID)))
+}
+
 func writeBirthCertificate(backend string, agentPID int, paneID string, cert map[string]any) {
 	if agentPID <= 0 || cert == nil {
 		return
 	}
-	safeBackend := strings.NewReplacer("/", "-", "\\", "-").Replace(backend)
-	raw, _ := json.Marshal(cert)
-	_ = os.WriteFile(filepath.Join(paneLogsDir(), fmt.Sprintf("birth-%s-%d-%s.json", safeBackend, agentPID, paneToken(paneID))), raw, 0o600)
-}
-
-func ClearPaneRuntimeState(paneID string) {
-	if paneID == "" {
+	if paneToken(paneID) == "unknown" {
 		return
 	}
-	for _, suffix := range []string{".pid", ".meta.json", ".cwd"} {
+	raw, _ := json.Marshal(cert)
+	_ = os.WriteFile(birthCertificatePath(backend, agentPID, paneID), raw, 0o600)
+}
+
+// ClearPaneRuntimeState removes every file SessionStart recorded for the pane
+// or pane-less session, including its log and the certificate copies that
+// prove its identity. The lock file stays: a straggling ws-hook may still hold
+// it, and the next SessionStart in the same pane must contend with that holder.
+func ClearPaneRuntimeState(paneID string) {
+	if !hasRuntimeState(paneID) {
+		return
+	}
+	meta := ReadPaneRuntimeMetadata(paneID)
+	for _, suffix := range []string{".pid", ".meta.json", ".cwd", ".log"} {
 		_ = os.Remove(wsHookPath(paneID, suffix))
+	}
+	backend := stringValue(meta, "backend")
+	if backend == "" {
+		return
+	}
+	if pid := intFromAny(meta["agent_pid"]); pid > 0 {
+		_ = os.Remove(birthCertificatePath(backend, pid, paneID))
+	}
+	if session := stringValue(meta, "hook_session_id"); session != "" {
+		_ = os.Remove(runtimeIdentityPath(backend, session))
 	}
 }
 
@@ -290,10 +348,12 @@ func updateStatus(identifier, status, turnState, model string, byPane bool) bool
 	if identifier == "" {
 		return false
 	}
-	payload := map[string]any{"name": identifier, "status": status}
+	// The daemon reads peer_name (hub.SessionUpdateRequest); a "name" key is
+	// silently dropped, which the pane branch hid by replacing it outright.
+	payload := map[string]any{"peer_name": identifier, "status": status}
 	if byPane {
 		payload["pane_id"] = identifier
-		delete(payload, "name")
+		delete(payload, "peer_name")
 	}
 	if turnState != "" {
 		payload["turn_state"] = turnState
@@ -326,6 +386,28 @@ func tmuxPlacement(info tmuxInfo) (proto.CircleBoundary, string, string, error) 
 	return boundary, proto.TmuxCircle(boundary, info.SessionName, info.WindowID), source, err
 }
 
+// fallbackCircle places a session that no tmux boundary or spawn hint claims:
+// an explicit REPOWIRE_CIRCLE, else the project circle the Pi and OpenCode
+// plugins derive, so every standalone session on one checkout meets there.
+func fallbackCircle(cwd string) string {
+	if explicit := strings.TrimSpace(os.Getenv(circleEnv)); explicit != "" {
+		return explicit
+	}
+	return projectCircle(cwd)
+}
+
+func projectCircle(path string) string {
+	resolved, err := filepath.Abs(path)
+	if err != nil {
+		resolved = path
+	}
+	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = real
+	}
+	sum := sha256.Sum256([]byte(resolved))
+	return "project-" + hex.EncodeToString(sum[:6])
+}
+
 func tmuxSession(info tmuxInfo) string {
 	if info.SessionName == "" || info.WindowName == "" {
 		return ""
@@ -336,6 +418,10 @@ func tmuxSession(info tmuxInfo) string {
 func getPaneID() string {
 	if pane := os.Getenv("TMUX_PANE"); pane != "" {
 		return pane
+	}
+	if os.Getenv(runtimeKeyEnv) != "" {
+		// Exported only for pane-less sessions; skip the process and tmux scans.
+		return ""
 	}
 	parents := processParents(os.Getppid())
 	out, err := exec.Command("tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").Output()
@@ -361,8 +447,9 @@ func getPaneID() string {
 	return strings.TrimSpace(string(out))
 }
 
-func getTmuxInfo() tmuxInfo {
-	pane := getPaneID()
+func getTmuxInfo() tmuxInfo { return tmuxInfoFor(getPaneID()) }
+
+func tmuxInfoFor(pane string) tmuxInfo {
 	if pane == "" {
 		return tmuxInfo{}
 	}
@@ -433,6 +520,11 @@ func tmuxValue(paneID, format string) (string, bool) {
 }
 
 func panePID(paneID string) (int, bool) {
+	if paneID == "" {
+		// No pane to probe. Reporting "conclusively dead" here would retire a
+		// healthy pane-less peer, so the verdict stays inconclusive.
+		return 0, false
+	}
 	value, conclusive := tmuxValue(paneID, "#{pane_pid}")
 	if !conclusive || value == "" {
 		return 0, conclusive
@@ -451,6 +543,77 @@ func commandIsShell(pid int) (bool, bool) {
 
 func findAgentPID(paneID string) int {
 	_, pid := capturePaneBaseline(paneID)
+	return pid
+}
+
+// argvHostsAppServer reports whether argv is the Codex App Server subcommand.
+// Global options may sit between the executable and app-server. "--" ends
+// option parsing, so a later app-server token is prompt text.
+func argvHostsAppServer(argv []string) bool {
+	i := 0
+	for i < len(argv) && filepath.Base(argv[i]) != "codex" {
+		i++
+	}
+	if i >= len(argv) {
+		return false
+	}
+	i++
+	for i < len(argv) {
+		tok := argv[i]
+		if tok == "--" {
+			return false
+		}
+		if !strings.HasPrefix(tok, "-") {
+			return tok == "app-server"
+		}
+		name, _, eq := strings.Cut(tok, "=")
+		i++
+		if eq {
+			continue
+		}
+		if codexFlagTakesValue[name] && i < len(argv) && !strings.HasPrefix(argv[i], "-") {
+			i++
+		}
+	}
+	return false
+}
+
+var codexFlagTakesValue = map[string]bool{
+	"-c": true, "--config": true,
+	"--enable": true, "--disable": true,
+	"--remote": true, "--remote-auth-token-env": true,
+	"-i": true, "--image": true,
+	"-m": true, "--model": true,
+	"--local-provider": true,
+	"-p":               true, "--profile": true,
+	"-s": true, "--sandbox": true,
+	"-C": true, "--cd": true,
+	"--add-dir": true,
+	"-a":        true, "--ask-for-approval": true,
+}
+
+// hostedByAppServer reports whether the agent process is a Codex App Server.
+// Its threads are registered and steered by the codex bridge, so neither the
+// hooks nor the MCP shim may claim them. A variable so tests can stub it.
+var hostedByAppServer = func(pid int) bool {
+	argv, err := processArgv(pid)
+	return err == nil && argvHostsAppServer(argv)
+}
+
+// resolveAgentPID finds the agent that spawned this hook. Runtimes may run the
+// hook through a shell, so a shell parent is skipped: via the pane's process
+// tree when there is a pane, else via the shell's own parent.
+func resolveAgentPID(paneID string) int {
+	pid := os.Getppid()
+	if isShell, known := commandIsShell(pid); !known || !isShell {
+		return pid
+	}
+	if found := findAgentPID(paneID); found > 0 {
+		return found
+	}
+	if parent := parentPID(pid); parent > 1 {
+		return parent
+	}
 	return pid
 }
 

@@ -10,7 +10,7 @@ as the message transport.
 | --- | --- |
 | `repowire-codex` user service | Runs the local Codex App Server and thread bridge |
 | `~/.codex/config.toml` | Installs the Repowire MCP tools |
-| `~/.codex/hooks.json` | A reminder-only Stop hook keeps unacknowledged asks visible |
+| `~/.codex/hooks.json` | SessionStart, UserPromptSubmit, and Stop hooks register a standalone Codex TUI, track its status, and resurface queued messages and open asks after a turn |
 
 The MCP entry points at the installed `repowire` binary:
 
@@ -23,13 +23,14 @@ args = ["mcp"]
 REPOWIRE_BACKEND = "codex"
 ```
 
-Older Codex releases without `app-server --listen` retain the hooks transport.
-
 ## Registration and delivery
 
 `repowire setup` installs an independently supervised Codex companion. It starts
-`codex app-server --listen unix://`; plain `codex`, `codex resume`, and the normal
-TUI automatically use that local control socket.
+`codex app-server --listen unix://`. A TUI joins that server when it is started
+with `codex --remote unix://` (or `codex resume <thread> --remote unix://`); the
+thread then lives in the App Server and gets the full transport described here.
+A plain `codex` runs its own in-process core, which the App Server cannot see or
+steer; it takes the hooks path described under "Standalone TUI".
 
 A thread registers as soon as Codex creates it, before its first user prompt.
 There is no warmup prompt or `UserPromptSubmit` one-turn delay. Repowire sends an
@@ -59,10 +60,31 @@ therefore uses the same `peer_id` as the App Server thread instead of lazily
 creating a second peer. `CODEX_THREAD_ID` remains a fallback for Codex surfaces
 that launch MCP per thread.
 
-The Stop hook remains as a narrow reliability backstop: if Codex completes a
-turn without acknowledging an open ask, it blocks with a reminder. It does
-not register the peer, report status or chat, or deliver messages; App Server
-owns those paths.
+The hooks step aside for App Server threads: when the hosting process is
+`codex app-server`, SessionStart and UserPromptSubmit do nothing, and Stop only
+blocks with a reminder if Codex completed a turn without acknowledging an open
+ask. Registration, status, chat, and delivery for those threads stay with the
+bridge.
+
+## Standalone TUI
+
+A plain `codex` (no `--remote`) is registered by its SessionStart hook, which
+also starts a `repowire ws-hook` sidecar. The sidecar holds the WebSocket and
+watches the Codex process, so the peer stays online until Codex exits.
+UserPromptSubmit reports `busy` and Stop reports `online`. A session that
+started before the hooks were installed registers at its first Stop instead.
+The MCP shim resolves `whoami` to that peer through the daemon certificate the
+hook stores under the thread id and the Codex process id.
+
+Without tmux, the circle is `REPOWIRE_CIRCLE` when set, else the
+`project-<sha256(path)[:12]>` circle that Pi and OpenCode sessions on the same
+checkout use.
+
+Inbound delivery to a standalone TUI is not push. Codex has no native inbox, so
+the sidecar reports the delivery as failed and the daemon queues it; the
+message surfaces as the Stop hook's block reason at the end of Codex's next
+turn, and open asks are reminded the same way. For immediate `turn/start`
+delivery, start the TUI with `codex --remote unix://`.
 
 Tmux remains useful for hosting and restarting a TUI, but it is not used for
 message delivery. When exactly one tmux circle matches a Codex thread's working
@@ -98,8 +120,10 @@ codex
 repowire peer list
 ```
 
-The Codex peer should already be listed. Its metadata reports
-`transport=codex-app-server`, and its TUI remains interactive.
+The Codex peer should already be listed. An App Server thread reports
+`transport=codex-app-server`; a standalone TUI reports `circle_source=fallback`
+outside tmux and comes online at SessionStart. The TUI remains interactive in
+both cases.
 
 ### macOS process ownership
 
@@ -108,7 +132,9 @@ Repowire setup installs the official signed native Codex App Server as the user 
 ## Troubleshooting
 
 - Codex peer never registers → run `repowire service status`, then inspect
-  `~/.repowire/codex-bridge.log` and `~/.repowire/codex-app-server.log`.
+  `~/.repowire/codex-bridge.log` and `~/.repowire/codex-app-server.log`. For a
+  standalone TUI, confirm `~/.codex/hooks.json` has the `SessionStart` entry,
+  that Codex trusts it (`/hooks`), and read `~/.cache/repowire/logs/ws-hook-*.log`.
 - Codex joins `default` instead of a tmux circle → more than one Codex tmux
   circle matched the same working directory, or none did. Spawn it through
   Repowire for an explicit circle.

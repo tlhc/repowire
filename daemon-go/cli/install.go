@@ -471,17 +471,11 @@ func installCodex() error {
 	hooksPath := home(".codex", "hooks.json")
 	data, _ := readJSON(hooksPath, false)
 	hooks := mapChild(data, "hooks")
+	// A standalone codex TUI registers and stays online through these hooks;
+	// the hook itself steps aside for App Server threads, which the bridge owns.
 	specs := map[string][]string{"SessionStart": {"hook session --backend=codex", "startup|resume|clear"}, "Stop": {"hook stop --backend=codex", ""}, "UserPromptSubmit": {"hook prompt --backend=codex", ""}}
-	nativeThreads := codexAppServerSupported()
 	for event, spec := range specs {
-		if nativeThreads && event != "Stop" {
-			removeRepowireEntries(hooks, event)
-		} else {
-			if nativeThreads {
-				spec = []string{"hook stop --backend=codex --reminders-only", ""}
-			}
-			replaceHook(hooks, event, hookEntry(hookCommand(spec[0]), spec[1], 0))
-		}
+		replaceHook(hooks, event, hookEntry(hookCommand(spec[0]), spec[1], 0))
 	}
 	removeRepowireEntries(hooks, "SessionEnd")
 	if err := writeJSON(hooksPath, data); err != nil {
@@ -494,12 +488,6 @@ func installCodex() error {
 	content = replaceTomlSection(content, "mcp_servers.repowire", []string{"command = " + strconv.Quote(executable()), "args = [\"mcp\"]"})
 	content = replaceTomlSection(content, "mcp_servers.repowire.env", []string{"REPOWIRE_BACKEND = \"codex\""})
 	for event, spec := range specs {
-		if nativeThreads && event != "Stop" {
-			continue
-		}
-		if nativeThreads {
-			spec = []string{"hook stop --backend=codex --reminders-only", ""}
-		}
 		entries, _ := hooks[event].([]any)
 		for groupIndex, raw := range entries {
 			entry, _ := raw.(map[string]any)

@@ -1,7 +1,8 @@
 # First ask
 
 Open two agents in separate tmux windows. Claude Code registers through its
-session hook; Codex registers through App Server as soon as its thread opens.
+session hook; Codex registers through App Server when started with
+`--remote unix://`, else through its own session hook.
 
 ```bash
 # window 1
